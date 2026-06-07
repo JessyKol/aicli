@@ -1,0 +1,1081 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+#  aicli — AI-powered CLI assistant
+#  Modes: cmd (default) | script | chat
+#  Requires: bash ≥ 3.2, curl, jq
+#  Platforms: macOS · Linux · iOS iSH · Android Termux
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+VERSION="1.0.0"
+PROG="aicli"
+
+# ── ANSI colors ───────────────────────────────────────────────────────────────
+if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ] && [ "${TERM:-}" != "dumb" ]; then
+  RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+  RED=$'\033[31m';  GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+  CYAN=$'\033[36m'; GRAY=$'\033[90m'
+else
+  RESET=""; BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; GRAY=""
+fi
+
+die()  { printf "${RED}✗ %s${RESET}\n" "$*" >&2; exit 1; }
+info() { printf "${DIM}%s${RESET}\n" "$*"; }
+ok()   { printf "${GREEN}✓ %s${RESET}\n" "$*"; }
+warn() { printf "${YELLOW}⚠ %s${RESET}\n" "$*"; }
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# 控制：--verbose/-v 输出到 stderr；--log <file> 同时写文件
+# 环境变量 AICLI_LOG=<file> 也可触发文件日志
+_VERBOSE=false
+_LOG_FILE="${AICLI_LOG:-}"
+
+log() {
+  # log <level> <msg>   level: DEBUG INFO WARN
+  local level="$1"; shift
+  local msg="$*"
+  local ts; ts="$(date '+%H:%M:%S')"
+  if [ "$_VERBOSE" = "true" ]; then
+    case "$level" in
+      DEBUG) printf "${GRAY}[%s DBG] %s${RESET}\n" "$ts" "$msg" >&2 ;;
+      INFO)  printf "${DIM}[%s INF] %s${RESET}\n"  "$ts" "$msg" >&2 ;;
+      WARN)  printf "${YELLOW}[%s WRN] %s${RESET}\n" "$ts" "$msg" >&2 ;;
+    esac
+  fi
+  if [ -n "$_LOG_FILE" ]; then
+    printf "[%s %s] %s\n" "$ts" "$level" "$msg" >> "$_LOG_FILE"
+  fi
+}
+
+log_req() {
+  # log_req <provider> <model> <prompt_preview>
+  log INFO "provider=$1  model=$2"
+  log DEBUG "prompt=$(printf '%s' "$3" | cut -c1-120 | tr '\n' ' ')…"
+}
+
+log_resp() {
+  # log_resp <elapsed_ms> <preview>
+  log INFO "elapsed=${1}ms"
+  log DEBUG "response=$(printf '%s' "$2" | cut -c1-120 | tr '\n' ' ')…"
+}
+
+# ── Platform detection ────────────────────────────────────────────────────────
+detect_os() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) echo "macos" ;;
+    Linux)
+      [ -e /proc/ish ] && echo "ios_ish" && return
+      case "${PREFIX:-}" in *termux*) echo "android_termux" && return ;; esac
+      [ -d /data/data/com.termux ] && echo "android_termux" && return
+      echo "linux"
+      ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+detect_shell() {
+  local sh
+  sh="$(basename "${SHELL:-}")"
+  [ -n "$sh" ] && echo "$sh" && return
+  # fallback: inspect parent process
+  sh="$(ps -p "$PPID" -o comm= 2>/dev/null | tr -d '-')" || true
+  echo "${sh:-sh}"
+}
+
+OS="$(detect_os)"
+CURRENT_SHELL="$(detect_shell)"
+
+# ── 环境探测（一次性，供后续使用）────────────────────────────────────────────
+# 检测 sleep 是否支持小数（busybox/Termux/iSH 不支持）
+if sleep 0.1 >/dev/null 2>&1; then _SLEEP_CMD="sleep 0.1"; else _SLEEP_CMD="sleep 1"; fi
+
+# 检测终端是否支持 UTF-8（决定 spinner 字符集）
+if printf '%s' "${LANG:-}${LC_ALL:-}${LC_CTYPE:-}" | grep -qi "utf"; then
+  _SPIN_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'; _SPIN_LEN=10
+else
+  _SPIN_CHARS='|/-\'; _SPIN_LEN=4
+fi
+
+# ── Config paths ──────────────────────────────────────────────────────────────
+CONFIG_DIR="${HOME}/.config/aicli"
+CONFIG_FILE="${CONFIG_DIR}/config"
+SESSIONS_DIR="${CONFIG_DIR}/sessions"
+mkdir -p "${CONFIG_DIR}" "${SESSIONS_DIR}"
+
+# touch config if missing
+[ -f "${CONFIG_FILE}" ] || cat > "${CONFIG_FILE}" <<'EOF'
+model=claude-sonnet
+mode=cmd
+confirm=false
+EOF
+
+cfg_get() { grep -E "^${1}=" "${CONFIG_FILE}" 2>/dev/null | tail -1 | cut -d= -f2-; }
+
+cfg_set() {
+  local key="$1" val="$2"
+  if grep -qE "^${key}=" "${CONFIG_FILE}" 2>/dev/null; then
+    # BSD sed (macOS) 需要 -i ''；GNU/busybox sed 直接 -i
+    if sed --version 2>/dev/null | grep -q GNU; then
+      sed -i "s|^${key}=.*|${key}=${val}|" "${CONFIG_FILE}"
+    else
+      sed -i '' "s|^${key}=.*|${key}=${val}|" "${CONFIG_FILE}" 2>/dev/null || \
+      sed -i    "s|^${key}=.*|${key}=${val}|" "${CONFIG_FILE}"
+    fi
+  else
+    printf '%s=%s\n' "$key" "$val" >> "${CONFIG_FILE}"
+  fi
+}
+
+# API key helpers: env vars take precedence over config file
+get_key() {
+  local name="$1" env_var="$2"
+  local v="${!env_var:-}"
+  [ -n "$v" ] && echo "$v" && return
+  cfg_get "apikey_${name}"
+}
+
+# ── Dependency guard ──────────────────────────────────────────────────────────
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required but not found. Run: ${PROG} check"
+}
+
+# ── jq helpers ────────────────────────────────────────────────────────────────
+# Build a JSON string value safely via jq
+jq_str() { jq -n --arg v "$1" '$v'; }
+
+# Parse a key from JSON on stdin
+jq_get() { jq -r "${1}"; }
+
+# Append a message object to a JSON array file
+msgs_append() {
+  local file="$1" role="$2" content="$3"
+  local tmp; tmp="$(mktemp)"
+  jq --arg r "$role" --arg c "$content" \
+     '. + [{"role":$r,"content":$c}]' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# ── Spinner ───────────────────────────────────────────────────────────────────
+_spin_pid=""
+spin_start() {
+  local label="${1:-thinking}"
+  (
+    local chars="$_SPIN_CHARS" len="$_SPIN_LEN" i=0
+    while true; do
+      printf "\r${DIM}%s %s...${RESET}  " "${chars:$i:1}" "$label"
+      i=$(( (i + 1) % len ))
+      $_SLEEP_CMD
+    done
+  ) &
+  _spin_pid=$!
+}
+spin_stop() {
+  if [ -n "${_spin_pid}" ]; then
+    kill "${_spin_pid}" 2>/dev/null
+    wait "${_spin_pid}" 2>/dev/null || true   # killed 进程返回非零，必须 || true 避免 set -e 退出
+    _spin_pid=""
+  fi
+  printf "\r%50s\r" ""
+}
+trap 'spin_stop' EXIT
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PROVIDER / MODEL CATALOG
+#  默认版本在此维护，也可通过 ~/.config/aicli/models.conf 覆盖
+#  格式：alias=provider:model-id
+# ─────────────────────────────────────────────────────────────────────────────
+MODELS_CONF="${CONFIG_DIR}/models.conf"
+
+# 内置默认值（最新版本）
+_builtin_models() {
+  cat <<'CATALOG'
+# Anthropic — Claude
+claude-sonnet=anthropic:claude-sonnet-4-6
+claude-opus=anthropic:claude-opus-4-8
+sonnet=anthropic:claude-sonnet-4-6
+opus=anthropic:claude-opus-4-8
+haiku=anthropic:claude-haiku-3-5
+
+# OpenAI — GPT
+gpt=openai:gpt-5.5
+gpt-5.5=openai:gpt-5.5
+o3=openai:o3
+
+# DeepSeek
+deepseek=deepseek:deepseek-v4
+deepseek-r1=deepseek:deepseek-reasoner
+
+# Google — Gemini
+gemini=gemini:gemini-2.5-pro
+gemini-pro=gemini:gemini-2.5-pro
+gemini-flash=gemini:gemini-2.0-flash
+
+# ZhipuAI — GLM
+glm=zhipu:glm-4.1v
+glm-4=zhipu:glm-4.1v
+glm-flash=zhipu:glm-4-flash
+
+# MiniMax
+minimax=minimax:abab6.5s-chat
+CATALOG
+}
+
+# 查找 alias → "provider model-id"
+# 优先读 models.conf（用户自定义），找不到则查内置
+resolve_model() {
+  local alias="$1"
+
+  # 1. 用户自定义 models.conf
+  if [ -f "${MODELS_CONF}" ]; then
+    local line; line="$(grep -E "^${alias}=" "${MODELS_CONF}" 2>/dev/null | tail -1)"
+    if [ -n "$line" ]; then
+      local val="${line#*=}"
+      echo "${val%%:*} ${val#*:}"
+      return
+    fi
+  fi
+
+  # 2. 内置默认
+  local line; line="$(_builtin_models | grep -E "^${alias}=" | tail -1)"
+  if [ -n "$line" ]; then
+    local val="${line#*=}"
+    echo "${val%%:*} ${val#*:}"
+    return
+  fi
+
+  # 3. provider:model 直接格式（如 anthropic:claude-3-5-sonnet）
+  case "$alias" in
+    anthropic:*) echo "anthropic ${alias#anthropic:}"; return ;;
+    openai:*)    echo "openai    ${alias#openai:}";    return ;;
+    deepseek:*)  echo "deepseek  ${alias#deepseek:}";  return ;;
+    zhipu:*)     echo "zhipu     ${alias#zhipu:}";     return ;;
+    gemini:*)    echo "gemini    ${alias#gemini:}";    return ;;
+    minimax:*)   echo "minimax   ${alias#minimax:}";   return ;;
+    openrouter:*)echo "openrouter ${alias#openrouter:}"; return ;;
+  esac
+
+  # 4. 含 / 的视为 openrouter 透传（如 meta-llama/llama-3.3-70b）
+  case "$alias" in
+    */*) echo "openrouter $alias"; return ;;
+  esac
+
+  # 5. 未知 → 透传给 openrouter
+  echo "openrouter $alias"
+}
+
+# ── HTTP call wrappers ────────────────────────────────────────────────────────
+
+# Shared curl flags
+_curl() { curl -sS --max-time 90 "$@"; }
+
+# Anthropic Messages API
+call_anthropic() {
+  local messages="$1" model="$2" system="$3"
+  local api_key; api_key="$(get_key anthropic ANTHROPIC_API_KEY)"
+  [ -z "$api_key" ] && die "No Anthropic key. Run: ${PROG} config --set anthropic.api_key=sk-ant-..."
+
+  local payload
+  payload="$(jq -n \
+    --arg     model   "$model"   \
+    --argjson messages "$messages" \
+    --arg     system  "$system"  \
+    '{model:$model, max_tokens:4096, messages:$messages, system:$system}')"
+
+  local resp
+  resp="$(_curl -X POST "https://api.anthropic.com/v1/messages" \
+    -H "x-api-key: ${api_key}" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "$payload")"
+
+  # surface API errors
+  local err; err="$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)"
+  [ -n "$err" ] && die "Anthropic: $err"
+  printf '%s' "$resp" | jq -r '.content[0].text'
+}
+
+# OpenAI-compatible (OpenAI / DeepSeek / ZhipuAI / OpenRouter)
+call_openai_compat() {
+  local messages="$1" model="$2" api_key="$3" base_url="$4" system="$5"
+  local extra_headers="${6:-}"   # optional extra headers string for curl
+
+  local msgs_final
+  if [ -n "$system" ]; then
+    msgs_final="$(jq -n \
+      --arg     sys  "$system"   \
+      --argjson msgs "$messages" \
+      '[{"role":"system","content":$sys}] + $msgs')"
+  else
+    msgs_final="$messages"
+  fi
+
+  local payload
+  payload="$(jq -n \
+    --arg     model    "$model"      \
+    --argjson messages "$msgs_final" \
+    '{model:$model, max_tokens:4096, messages:$messages}')"
+
+  # build curl command
+  local resp
+  # shellcheck disable=SC2086
+  resp="$(_curl -X POST "${base_url}/chat/completions" \
+    -H "Authorization: Bearer ${api_key}" \
+    -H "Content-Type: application/json" \
+    ${extra_headers} \
+    -d "$payload")"
+
+  local err; err="$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)"
+  [ -n "$err" ] && die "API error: $err"
+  printf '%s' "$resp" | jq -r '.choices[0].message.content'
+}
+
+# Google Gemini
+call_gemini() {
+  local messages="$1" model="$2" system="$3"
+  local api_key; api_key="$(get_key gemini GEMINI_API_KEY)"
+  [ -z "$api_key" ] && die "No Gemini key. Run: ${PROG} config --set gemini.api_key=..."
+
+  local contents
+  contents="$(printf '%s' "$messages" | jq '[.[] | {
+    role: (if .role=="user" then "user" else "model" end),
+    parts: [{"text":.content}]
+  }]')"
+
+  local payload
+  if [ -n "$system" ]; then
+    payload="$(jq -n \
+      --argjson contents "$contents" \
+      --arg     sys      "$system"   \
+      '{contents:$contents, systemInstruction:{parts:[{text:$sys}]}}')"
+  else
+    payload="$(jq -n --argjson contents "$contents" '{contents:$contents}')"
+  fi
+
+  local resp
+  resp="$(_curl -X POST \
+    "https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${api_key}" \
+    -H "Content-Type: application/json" \
+    -d "$payload")"
+
+  local err; err="$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)"
+  [ -n "$err" ] && die "Gemini: $err"
+  printf '%s' "$resp" | jq -r '.candidates[0].content.parts[0].text'
+}
+
+# MiniMax
+call_minimax() {
+  local messages="$1" model="$2" system="$3"
+  local api_key; api_key="$(get_key minimax MINIMAX_API_KEY)"
+  local group_id; group_id="$(get_key minimax_group MINIMAX_GROUP_ID)"
+  [ -z "$api_key" ]   && die "No MiniMax key. Run: ${PROG} config --set minimax.api_key=..."
+  [ -z "$group_id" ]  && die "No MiniMax group_id. Run: ${PROG} config --set minimax.group_id=..."
+
+  local msgs_final
+  if [ -n "$system" ]; then
+    msgs_final="$(jq -n \
+      --arg     sys  "$system"   \
+      --argjson msgs "$messages" \
+      '[{"role":"system","content":$sys}] + $msgs')"
+  else
+    msgs_final="$messages"
+  fi
+
+  local payload
+  payload="$(jq -n \
+    --arg     model    "$model"      \
+    --argjson messages "$msgs_final" \
+    '{model:$model, max_tokens:4096, messages:$messages}')"
+
+  local resp
+  resp="$(_curl -X POST \
+    "https://api.minimax.chat/v1/text/chatcompletion_v2?GroupId=${group_id}" \
+    -H "Authorization: Bearer ${api_key}" \
+    -H "Content-Type: application/json" \
+    -d "$payload")"
+
+  local err; err="$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)"
+  [ -n "$err" ] && die "MiniMax: $err"
+  printf '%s' "$resp" | jq -r '.choices[0].message.content'
+}
+
+
+call_codex_cli() {
+  local messages="$1" model="$2" system="$3"
+  command -v codex >/dev/null 2>&1 || \
+    die "No OpenAI API key and 'codex' CLI not found.\n  Option 1:  aicli config --set openai.api_key=sk-...\n  Option 2:  Install & login: npm install -g @openai/codex && codex login"
+
+  local user_msg; user_msg="$(printf '%s' "$messages" | jq -r 'last | .content')"
+  # 明确告诉 codex 只输出文字，不要执行命令
+  local full_prompt="[TEXT RESPONSE ONLY — do not execute any commands]\n\n"
+  [ -n "$system" ] && full_prompt="${full_prompt}${system}\n\n"
+  full_prompt="${full_prompt}${user_msg}"
+
+  local out_file; out_file="$(mktemp)"
+  # -m 指定模型（必须）
+  # --sandbox read-only 禁止执行，避免 agent 卡在审批
+  # 忽略退出码 143（SIGTERM 是 codex 正常退出方式）
+  codex exec \
+    --skip-git-repo-check \
+    --sandbox read-only \
+    -m "$model" \
+    -o "$out_file" \
+    "$full_prompt" >/dev/null 2>&1 || true
+
+  log DEBUG "codex out_file=$(wc -c < "$out_file" 2>/dev/null || echo 0) bytes  path=$out_file"
+  if [ -s "$out_file" ]; then
+    log DEBUG "codex response: $(head -1 "$out_file")"
+    cat "$out_file"; rm -f "$out_file"
+  else
+    rm -f "$out_file"
+    die "codex exec produced no output. Run: codex doctor"
+  fi
+}
+
+# ── Claude Code plan login (OAuth proxy via `claude -p`) ──────────────────────
+# When no API key is set, use the `claude` CLI which carries Claude Code's OAuth.
+call_claude_cli() {
+  local messages="$1" model="$2" system="$3"
+  command -v claude >/dev/null 2>&1 || \
+    die "Claude 需要 Anthropic API key 或 claude CLI 在 PATH。
+  方案 1 (API key):   aicli config --set anthropic.api_key=sk-ant-...
+                      获取: console.anthropic.com → API Keys
+  方案 2 (Claude Code CLI 已装): 把 claude 加入 PATH
+                      export PATH=\"\$HOME/.claude/bin:\$PATH\"
+  方案 3 (换模型):    aicli config --model deepseek"
+
+  # Build a single-turn prompt: prepend system then last user message
+  local user_msg; user_msg="$(printf '%s' "$messages" | jq -r 'last | .content')"
+  local full_prompt="$user_msg"
+  [ -n "$system" ] && full_prompt="$(printf '%s\n\n%s' "$system" "$user_msg")"
+
+  # claude -p = non-interactive print mode; --model if specified
+  local model_flag=""
+  [ -n "$model" ] && model_flag="--model $model"
+
+  # shellcheck disable=SC2086
+  claude -p $model_flag "$full_prompt" 2>/dev/null || \
+    die "claude CLI failed. Check: claude --version"
+}
+
+# ── Universal LLM dispatcher ──────────────────────────────────────────────────
+# Usage: llm_call <messages_json> [model] [system_prompt]
+# model defaults to $_AICLI_MODEL (set by main) → config → claude-sonnet
+llm_call() {
+  local messages="$1"
+  local model="${2:-${_AICLI_MODEL:-$(cfg_get model || echo claude-sonnet)}}"
+  local system="${3:-}"
+
+  need curl; need jq
+
+  local pair; pair="$(resolve_model "$model")"
+  local provider; provider="$(echo "$pair" | cut -d' ' -f1)"
+  local model_id;  model_id="$(echo  "$pair" | cut -d' ' -f2-)"
+
+  local _user_preview; _user_preview="$(printf '%s' "$messages" | jq -r 'last | .content' 2>/dev/null || true)"
+  log_req "$provider" "$model_id" "$_user_preview"
+  local _t0; _t0="$SECONDS"
+
+  case "$provider" in
+    anthropic)
+      # No API key → fall back to Claude Code plan login via `claude -p`
+      local k; k="$(get_key anthropic ANTHROPIC_API_KEY)"
+      if [ -z "$k" ]; then
+        call_claude_cli "$messages" "$model_id" "$system"
+      else
+        call_anthropic "$messages" "$model_id" "$system"
+      fi ;;
+    openai)
+      local k; k="$(get_key openai OPENAI_API_KEY)"
+      if [ -z "$k" ]; then
+        call_codex_cli "$messages" "$model_id" "$system"
+      else
+        call_openai_compat "$messages" "$model_id" "$k" "https://api.openai.com/v1" "$system"
+      fi ;;
+    deepseek)
+      local k; k="$(get_key deepseek DEEPSEEK_API_KEY)"
+      [ -z "$k" ] && die "No DeepSeek key. Run: ${PROG} config --set deepseek.api_key=..."
+      call_openai_compat "$messages" "$model_id" "$k" "https://api.deepseek.com/v1" "$system" ;;
+    zhipu)
+      local k; k="$(get_key zhipu ZHIPU_API_KEY)"
+      [ -z "$k" ] && die "No ZhipuAI key. Run: ${PROG} config --set zhipu.api_key=..."
+      # code plan 用不同 endpoint；标准 plan 用默认地址
+      local zhipu_base
+      zhipu_base="$(cfg_get zhipu_base_url || echo "https://open.bigmodel.cn/api/paas/v4")"
+      call_openai_compat "$messages" "$model_id" "$k" "$zhipu_base" "$system" ;;
+    gemini)
+      call_gemini "$messages" "$model_id" "$system" ;;
+    minimax)
+      call_minimax "$messages" "$model_id" "$system" ;;
+    openrouter)
+      local k; k="$(get_key openrouter OPENROUTER_API_KEY)"
+      [ -z "$k" ] && die "No OpenRouter key. Run: ${PROG} config --set openrouter.api_key=..."
+      local base; base="$(cfg_get openrouter_base_url || echo "https://openrouter.ai/api/v1")"
+      call_openai_compat "$messages" "$model_id" "$k" "$base" "$system" \
+        '-H "HTTP-Referer: https://github.com/aicli" -H "X-Title: aicli"' ;;
+    *)
+      die "Unknown provider: $provider" ;;
+  esac
+  # 计时日志（通过临时文件读取返回值后计算）
+  local _t1; _t1="$SECONDS"
+  log INFO "elapsed=$(( _t1 - _t0 ))s  provider=$provider  model=$model_id"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODE: cmd
+# ─────────────────────────────────────────────────────────────────────────────
+CMD_SYSTEM="You are a shell command generator. Output ONLY the exact shell command — no explanation, no markdown fences, no commentary.
+Rules:
+- Single line; chain steps with && or pipe
+- Correct syntax for: OS=${OS}, shell=${CURRENT_SHELL}
+- Readable over terse; no sudo unless requested
+- If ambiguous, pick the most common interpretation"
+
+mode_cmd() {
+  local prompt="$1" confirm="${2:-false}"
+  local messages
+  messages="$(jq -n --arg p "$prompt" '[{"role":"user","content":$p}]')"
+  local system="${CMD_SYSTEM/\$\{OS\}/$OS}"
+  system="${system/\$\{CURRENT_SHELL\}/$CURRENT_SHELL}"
+
+  spin_start "generating command"
+  local _tmp; _tmp="$(mktemp)"
+  llm_call "$messages" "" "$system" > "$_tmp" || { spin_stop; rm -f "$_tmp"; exit 1; }
+  spin_stop
+
+  log DEBUG "tmp_bytes=$(wc -c < "$_tmp")  tmp_content=$(head -1 "$_tmp")"
+
+  local cmd; cmd="$(cat "$_tmp")"; rm -f "$_tmp"
+
+  # strip any accidental markdown fences
+  cmd="$(printf '%s' "$cmd" | sed 's/^```[a-z]*//; s/^```//' | tr -d '`' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+  log DEBUG "cmd_after_strip=$(printf '%s' "$cmd" | cut -c1-80)"
+
+  if [ -z "$cmd" ]; then
+    die "LLM returned empty response. Try --verbose to debug."
+  fi
+
+  printf "\n  ${CYAN}${BOLD}%s${RESET}\n\n" "$cmd"
+
+  local run=true
+  if [ "$confirm" = "true" ] || [ "$(cfg_get confirm)" = "true" ]; then
+    printf "${YELLOW}Run? [Y/n] ${RESET}"
+    read -r ans
+    case "${ans:-y}" in [Nn]*) run=false ;; esac
+  fi
+
+  if [ "$run" = "true" ]; then
+    eval "$cmd" || printf "${YELLOW}exit code: %d${RESET}\n" $?
+  else
+    printf "${GRAY}Cancelled.${RESET}\n"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODE: script
+# ─────────────────────────────────────────────────────────────────────────────
+SCRIPT_SYSTEM="You are a script generator. Produce a complete, working script.
+Rules:
+- Language: LANG_HINT — default: choose simplest (sh for simple tasks, python3 for data/logic, node/ts for complex apps)
+- Proper shebang line required
+- Minimal comments; only where logic is non-obvious
+- Argument parsing where useful
+- After the script body, place exactly this line on its own: ---USAGE---
+  Then write: how to run, arguments, examples.
+
+OS context: OS_CTX"
+
+mode_script() {
+  local prompt="$1" lang="${2:-auto}" output="${3:-}"
+  local lang_hint="auto (choose simplest)"
+  [ "$lang" != "auto" ] && lang_hint="$lang"
+
+  local system="$SCRIPT_SYSTEM"
+  system="${system/LANG_HINT/$lang_hint}"
+  system="${system/OS_CTX/${OS}, shell: ${CURRENT_SHELL}}"
+
+  local messages
+  messages="$(jq -n --arg p "$prompt" '[{"role":"user","content":$p}]')"
+
+  spin_start "generating script"
+  local _tmp; _tmp="$(mktemp)"
+  llm_call "$messages" "" "$system" > "$_tmp" || { spin_stop; rm -f "$_tmp"; exit 1; }
+  spin_stop
+  local response; response="$(cat "$_tmp")"; rm -f "$_tmp"
+
+  # Strip outer markdown code fence if present
+  if printf '%s' "$response" | grep -qE '^```'; then
+    response="$(printf '%s' "$response" | sed '1{/^```/d}; ${/^```/d}')"
+  fi
+
+  # Split on ---USAGE---
+  local script_body usage_text
+  script_body="$(printf '%s' "$response" | awk '/^---USAGE---/{exit} {print}')"
+  usage_text="$(printf '%s' "$response"  | awk 'f{print} /^---USAGE---/{f=1}')"
+
+  # Determine file extension from shebang
+  local ext=".sh"
+  local first_line; first_line="$(printf '%s' "$script_body" | head -1)"
+  case "$first_line" in
+    *python3*|*python*) ext=".py" ;;
+    *node*|*ts-node*|*deno*) ext=".ts" ;;
+    *bash*|*zsh*|*sh*|*ash*) ext=".sh" ;;
+  esac
+
+  # Output path
+  local dest
+  if [ -n "$output" ]; then
+    dest="$output"
+  else
+    local hash; hash="$(printf '%s' "$prompt" | cksum | cut -d' ' -f1)"
+    dest="/tmp/aicli_${hash}${ext}"
+  fi
+
+  printf '%s\n' "$script_body" > "$dest"
+  chmod +x "$dest"
+
+  printf "\n${GREEN}✓ Saved:${RESET}  %s\n\n" "$dest"
+
+  # Preview (first 25 lines)
+  local linecount; linecount="$(wc -l < "$dest")"
+  head -25 "$dest" | while IFS= read -r line; do
+    printf "  ${GRAY}%s${RESET}\n" "$line"
+  done
+  [ "$linecount" -gt 25 ] && printf "  ${DIM}… %d more lines${RESET}\n" $(( linecount - 25 ))
+
+  printf "\n"
+  if [ -n "$usage_text" ]; then
+    printf "${CYAN}Usage:${RESET}\n"
+    printf '%s\n' "$usage_text" | while IFS= read -r line; do
+      printf "  %s\n" "$line"
+    done
+  else
+    printf "${CYAN}Run:${RESET}  %s\n" "$dest"
+  fi
+  printf "\n"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODE: chat
+# ─────────────────────────────────────────────────────────────────────────────
+CHAT_SYSTEM="You are a concise, precise, sharp assistant.
+- Answer directly; no filler, no hedging, no apologies
+- Technical questions get technical answers
+- Opinions are direct, not diplomatic waffle
+- Code examples when useful; never over-explain
+- Default length: as short as the answer allows"
+
+mode_chat() {
+  local initial_prompt="${1:-}" session="${2:-}"
+  local hist_file; hist_file="$(mktemp /tmp/aicli_chat_XXXXXX.json)"
+  echo '[]' > "$hist_file"
+
+  # Load saved session
+  if [ -n "$session" ] && [ -f "${SESSIONS_DIR}/${session}.json" ]; then
+    cp "${SESSIONS_DIR}/${session}.json" "$hist_file"
+    local count; count="$(jq 'length' "$hist_file")"
+    info "Loaded session '${session}' ($(( count / 2 )) exchanges)"
+  fi
+
+  local model; model="$(cfg_get model || echo claude-sonnet)"
+  printf "${DIM}Chat  •  model: %s  •  /? for commands${RESET}\n\n" "$model"
+
+  chat_send() {
+    local text="$1"
+    msgs_append "$hist_file" "user" "$text"
+    local messages; messages="$(cat "$hist_file")"
+    spin_start "thinking"
+    local _tmp; _tmp="$(mktemp)"
+    llm_call "$messages" "$model" "$CHAT_SYSTEM" > "$_tmp" || {
+      spin_stop; rm -f "$_tmp"
+      jq '.[:-1]' "$hist_file" > "${hist_file}.tmp" && mv "${hist_file}.tmp" "$hist_file"
+      return
+    }
+    spin_stop
+    local reply; reply="$(cat "$_tmp")"; rm -f "$_tmp"
+    msgs_append "$hist_file" "assistant" "$reply"
+    printf "\n${CYAN}%s${RESET}\n\n" "$reply"
+  }
+
+  if [ -n "$initial_prompt" ]; then
+    printf "${BOLD}You:${RESET} %s\n" "$initial_prompt"
+    chat_send "$initial_prompt"
+  fi
+
+  # Enable readline if available
+  local read_flags="-r"
+  [[ "${BASH_VERSION:-}" > "4" ]] && read_flags="-re"
+
+  while true; do
+    printf "${BOLD}You:${RESET} "
+    # shellcheck disable=SC2229
+    if ! read $read_flags input; then
+      printf "\n${GRAY}Bye.${RESET}\n"; break
+    fi
+    input="${input%%$'\n'}"
+    [ -z "$input" ] && continue
+
+    case "$input" in
+      /exit|/quit|exit|quit)
+        printf "${GRAY}Bye.${RESET}\n"; break ;;
+
+      "/?"| /help)
+        printf "${DIM}
+  /clear          — reset context
+  /save [id]      — save session to disk
+  /load <id>      — load a saved session
+  /sessions       — list saved sessions
+  /model <name>   — switch model mid-chat
+  /model          — show current model
+  /exit           — quit
+${RESET}\n" ;;
+
+      /clear)
+        echo '[]' > "$hist_file"
+        info "Context cleared." ;;
+
+      /sessions)
+        printf "${CYAN}Saved sessions:${RESET}\n"
+        for f in "${SESSIONS_DIR}"/*.json; do
+          [ -f "$f" ] || continue
+          local sid; sid="$(basename "$f" .json)"
+          local n; n="$(jq 'length' "$f")"
+          printf "  %-20s  %d exchanges\n" "$sid" $(( n / 2 ))
+        done ;;
+
+      /save*)
+        local sid="${input#/save}"; sid="${sid# }"
+        [ -z "$sid" ] && sid="default"
+        cp "$hist_file" "${SESSIONS_DIR}/${sid}.json"
+        info "Session saved as '${sid}'." ;;
+
+      /load*)
+        local sid="${input#/load}"; sid="${sid# }"
+        if [ -f "${SESSIONS_DIR}/${sid}.json" ]; then
+          cp "${SESSIONS_DIR}/${sid}.json" "$hist_file"
+          local n; n="$(jq 'length' "$hist_file")"
+          info "Loaded '${sid}' ($(( n / 2 )) exchanges)."
+        else
+          warn "Session '${sid}' not found."
+        fi ;;
+
+      /model*)
+        local arg="${input#/model}"; arg="${arg# }"
+        if [ -n "$arg" ]; then
+          model="$arg"
+          info "Model → ${arg}"
+        else
+          info "Current model: ${model}"
+        fi ;;
+
+      *)
+        chat_send "$input" ;;
+    esac
+  done
+
+  rm -f "$hist_file"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SUBCOMMAND: config
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_config() {
+  local action="${1:-show}"; shift || true
+
+  case "$action" in
+    --show|show)
+      printf "${BOLD}Config file:${RESET} %s\n\n" "$CONFIG_FILE"
+      while IFS='=' read -r key val; do
+        case "$key" in '#'*|'') continue ;; esac
+        # mask keys
+        case "$key" in *key*|*secret*|*token*)
+          printf "  %-30s = %s…\n" "$key" "${val:0:8}" ;;
+        *)
+          printf "  %-30s = %s\n" "$key" "$val" ;;
+        esac
+      done < "$CONFIG_FILE"
+      ;;
+
+    --set|set)
+      for pair in "$@"; do
+        case "$pair" in
+          anthropic.api_key=*)  cfg_set "apikey_anthropic"      "${pair#*=}" ;;
+          openai.api_key=*)     cfg_set "apikey_openai"         "${pair#*=}" ;;
+          deepseek.api_key=*)   cfg_set "apikey_deepseek"       "${pair#*=}" ;;
+          zhipu.api_key=*)      cfg_set "apikey_zhipu"          "${pair#*=}" ;;
+          gemini.api_key=*)     cfg_set "apikey_gemini"         "${pair#*=}" ;;
+          minimax.api_key=*)    cfg_set "apikey_minimax"        "${pair#*=}" ;;
+          minimax.group_id=*)   cfg_set "apikey_minimax_group"  "${pair#*=}" ;;
+          openrouter.api_key=*) cfg_set "apikey_openrouter"     "${pair#*=}" ;;
+          openrouter.base_url=*)cfg_set "openrouter_base_url"   "${pair#*=}" ;;
+          zhipu.base_url=*)     cfg_set "zhipu_base_url"        "${pair#*=}" ;;
+          model=*|mode=*|confirm=*)
+                                cfg_set "${pair%%=*}"           "${pair#*=}" ;;
+          *)
+            # generic key=value
+            cfg_set "${pair%%=*}" "${pair#*=}" ;;
+        esac
+        local k="${pair%%=*}"
+        local v="${pair#*=}"
+        case "$k" in *key*|*secret*)
+          ok "Set ${k} = ${v:0:8}…" ;;
+        *)
+          ok "Set ${k} = ${v}" ;;
+        esac
+      done
+      ;;
+
+    --model|model)
+      [ -n "${1:-}" ] && cfg_set "model" "$1" && ok "Default model → $1"
+      ;;
+
+    --models|models|list-models)
+      printf "${BOLD}Built-in model aliases${RESET}  (override in %s)\n\n" "${MODELS_CONF}"
+      _builtin_models | grep -v '^#' | grep -v '^$' | while IFS='=' read -r alias val; do
+        printf "  ${CYAN}%-20s${RESET} %s\n" "$alias" "${val}"
+      done
+      if [ -f "${MODELS_CONF}" ]; then
+        printf "\n${BOLD}Custom overrides${RESET}  (%s)\n\n" "${MODELS_CONF}"
+        grep -v '^#' "${MODELS_CONF}" | grep -v '^$' | while IFS='=' read -r alias val; do
+          printf "  ${GREEN}%-20s${RESET} %s\n" "$alias" "${val}"
+        done
+      fi
+      ;;
+
+    *)
+      die "Unknown config action: $action. Use: show | --set KEY=VAL | --model NAME | models"
+      ;;
+  esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SUBCOMMAND: check
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_check() {
+  local label
+  case "$OS" in
+    macos)          label="macOS" ;;
+    linux)          label="Linux" ;;
+    ios_ish)        label="iOS iSH" ;;
+    android_termux) label="Android Termux" ;;
+    *)              label="$OS" ;;
+  esac
+
+  printf "${BOLD}Environment${RESET}\n"
+  printf "  OS:     %s\n" "$label"
+  printf "  Shell:  %s\n" "$CURRENT_SHELL"
+  printf "  Bash:   %s\n" "${BASH_VERSION:-unknown}"
+  printf "\n${BOLD}Required tools${RESET}\n"
+
+  local hint_curl hint_jq
+  case "$OS" in
+    macos)
+      hint_curl="brew install curl"; hint_jq="brew install jq" ;;
+    linux)
+      # 自动探测包管理器
+      if   command -v apt-get >/dev/null 2>&1; then _pm="apt-get install"
+      elif command -v dnf     >/dev/null 2>&1; then _pm="dnf install"
+      elif command -v yum     >/dev/null 2>&1; then _pm="yum install"
+      elif command -v pacman  >/dev/null 2>&1; then _pm="pacman -S"
+      elif command -v zypper  >/dev/null 2>&1; then _pm="zypper install"
+      elif command -v apk     >/dev/null 2>&1; then _pm="apk add"
+      else _pm="<your-pkg-manager> install"
+      fi
+      hint_curl="sudo ${_pm} curl"
+      hint_jq="sudo ${_pm} jq" ;;
+    ios_ish)
+      hint_curl="apk add curl"; hint_jq="apk add jq" ;;
+    android_termux)
+      hint_curl="pkg install curl"; hint_jq="pkg install jq" ;;
+    *)
+      hint_curl="install curl"; hint_jq="install jq" ;;
+  esac
+
+  local missing=""
+  for tool in curl jq; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      printf "  ${GREEN}✓${RESET} %-10s %s\n" "$tool" "$(command -v "$tool")"
+    else
+      printf "  ${RED}✗${RESET} %-10s not found\n" "$tool"
+      missing="$missing $tool"
+    fi
+  done
+
+  if [ -n "$missing" ]; then
+    printf "\n${YELLOW}Install missing tools:${RESET}\n"
+    for t in $missing; do
+      case "$t" in
+        curl) printf "  ${CYAN}%s${RESET}\n" "$hint_curl" ;;
+        jq)   printf "  ${CYAN}%s${RESET}\n" "$hint_jq" ;;
+      esac
+    done
+  fi
+
+  printf "\n${BOLD}Configured providers${RESET}\n"
+  local providers=(anthropic openai deepseek zhipu gemini minimax openrouter)
+  for name in "${providers[@]}"; do
+    local k
+    k="$(cfg_get "apikey_${name}" || true)"
+    case "$name" in
+      anthropic)  [ -z "$k" ] && k="${ANTHROPIC_API_KEY:-}" ;;
+      openai)     [ -z "$k" ] && k="${OPENAI_API_KEY:-}" ;;
+      deepseek)   [ -z "$k" ] && k="${DEEPSEEK_API_KEY:-}" ;;
+      zhipu)      [ -z "$k" ] && k="${ZHIPU_API_KEY:-}" ;;
+      gemini)     [ -z "$k" ] && k="${GEMINI_API_KEY:-}" ;;
+      minimax)    [ -z "$k" ] && k="${MINIMAX_API_KEY:-}" ;;
+      openrouter) [ -z "$k" ] && k="${OPENROUTER_API_KEY:-}" ;;
+    esac
+    if [ -n "$k" ]; then
+      printf "  ${GREEN}✓${RESET} %-12s api key\n" "$name"
+    elif [ "$name" = "anthropic" ] && command -v claude >/dev/null 2>&1; then
+      printf "  ${GREEN}✓${RESET} %-12s claude code plan login  (via \`claude -p\`)\n" "$name"
+    else
+      printf "  ${GRAY}—${RESET} %-12s not configured\n" "$name"
+    fi
+  done
+
+  printf "\n${BOLD}Current settings${RESET}\n"
+  printf "  model:    %s\n" "$(cfg_get model   || echo claude-sonnet)"
+  printf "  mode:     %s\n" "$(cfg_get mode    || echo cmd)"
+  printf "  confirm:  %s\n" "$(cfg_get confirm || echo false)"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HELP
+# ─────────────────────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+${BOLD}aicli${RESET} v${VERSION} — AI-powered CLI assistant
+
+${BOLD}USAGE${RESET}
+  aicli [options] <prompt>
+  aicli -m script [options] <description>
+  aicli -m chat [prompt]
+  aicli config --set KEY=VALUE
+  aicli check
+
+${BOLD}MODES${RESET}  (-m / --mode)
+  cmd      Natural language → shell command, runs immediately  [default]
+  script   Generate a reusable script file (sh / py / ts / …)
+  chat     Multi-turn conversation with context
+
+${BOLD}OPTIONS${RESET}
+  -m, --mode  <cmd|script|chat>   Set mode
+  --model     <name>              LLM to use (see below)
+  --confirm                       Ask before running commands
+  --lang      <sh|py|ts|auto>     Script language preference
+  -o, --output <file>             Save script to path (script mode)
+  --session   <id>                Load/save chat session by name
+  -h, --help                      Show this help
+
+${BOLD}MODELS${RESET}  (默认最新版本，aicli config models 查看全部)
+  claude-sonnet → claude-sonnet-4-6   claude-opus → claude-opus-4-8
+  gpt           → gpt-4.5             deepseek    → deepseek-v4
+  gemini        → gemini-2.5-pro      glm         → glm-4.1v
+  provider:model-id  直接指定（如 anthropic:claude-3-7-sonnet）
+  含 / 的透传 openrouter（如 meta-llama/llama-3.3-70b）
+
+${BOLD}CONFIG${RESET}
+  aicli config --set anthropic.api_key=sk-ant-...
+  aicli config --set deepseek.api_key=...
+  aicli config --set openrouter.api_key=...
+  aicli config --model deepseek        # 切换默认模型
+  aicli config models                  # 查看/管理所有 model alias
+  aicli config show                    # 查看当前配置
+
+${BOLD}EXAMPLES${RESET}
+  aicli "list docker containers sorted by memory"
+  aicli --confirm "delete all .DS_Store files under \$HOME"
+  aicli --model deepseek "show top 10 processes by cpu"
+  aicli -m script "backup mysql to S3 with daily rotation"
+  aicli -m script --lang py "parse nginx logs and plot request rate"
+  aicli -m chat
+  aicli -m chat --session work "explain kubernetes ingress"
+  aicli check
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+main() {
+  # No args → help
+  [ $# -eq 0 ] && usage && exit 0
+
+  local mode="" model="" confirm="false" lang="auto" output="" session=""
+  local prompt_parts=()
+  local verbose="false" logfile=""
+
+  # Check for subcommands first
+  case "${1:-}" in
+    config)
+      shift
+      cmd_config "$@"
+      return ;;
+    check)
+      cmd_check
+      return ;;
+    -h|--help)
+      usage; return ;;
+    --version|-V)
+      echo "aicli $VERSION"; return ;;
+    model)
+      local cur; cur="$(cfg_get model || echo claude-sonnet)"
+      local pair; pair="$(resolve_model "$cur")"
+      local model_id; model_id="$(echo "$pair" | cut -d' ' -f2-)"
+      printf "model: ${BOLD}%s${RESET}  →  %s\n" "$cur" "$model_id"
+      return ;;
+  esac
+
+  # Parse flags
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--mode)    mode="$2";    shift 2 ;;
+      --model)      model="$2";   shift 2 ;;
+      --confirm)    confirm="true"; shift ;;
+      --lang)       lang="$2";    shift 2 ;;
+      -o|--output)  output="$2";  shift 2 ;;
+      --session)    session="$2"; shift 2 ;;
+      -v|--verbose) verbose="true"; shift ;;
+      --log)        logfile="$2"; shift 2 ;;
+      -h|--help)    usage; return ;;
+      --)           shift; prompt_parts+=("$@"); break ;;
+      -*)           die "Unknown option: $1" ;;
+      *)            prompt_parts+=("$1"); shift ;;
+    esac
+  done
+
+  # Determine effective mode and model
+  [ -z "$mode" ]  && mode="$(cfg_get mode  || echo cmd)"
+  [ -z "$model" ] && model="$(cfg_get model || echo claude-sonnet)"
+
+  # Apply verbose / log settings
+  [ "$verbose" = "true" ] && _VERBOSE=true
+  [ -n "$logfile" ] && _LOG_FILE="$logfile"
+  if [ -n "$_LOG_FILE" ]; then
+    printf "=== aicli %s  %s ===\n" "$VERSION" "$(date)" >> "$_LOG_FILE"
+  fi
+
+  # Override model in config context for this run
+  export _AICLI_MODEL="$model"
+
+  local prompt="${prompt_parts[*]:-}"
+
+  case "$mode" in
+    cmd)
+      [ -z "$prompt" ] && die "Provide a prompt.  Example: aicli \"list large files\""
+      mode_cmd "$prompt" "$confirm"
+      ;;
+    script)
+      [ -z "$prompt" ] && die "Provide a description.  Example: aicli -m script \"backup postgres\""
+      mode_script "$prompt" "$lang" "$output"
+      ;;
+    chat)
+      mode_chat "$prompt" "$session"
+      ;;
+    *)
+      die "Unknown mode: $mode. Use: cmd | script | chat"
+      ;;
+  esac
+}
+
+main "$@"
