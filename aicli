@@ -104,7 +104,7 @@ mkdir -p "${CONFIG_DIR}" "${SESSIONS_DIR}"
 
 # touch config if missing
 [ -f "${CONFIG_FILE}" ] || cat > "${CONFIG_FILE}" <<'EOF'
-model=claude-sonnet
+model=glm
 mode=cmd
 confirm=false
 EOF
@@ -210,8 +210,8 @@ gemini-pro=gemini:gemini-2.5-pro
 gemini-flash=gemini:gemini-2.0-flash
 
 # ZhipuAI — GLM
-glm=zhipu:glm-4.1v
-glm-4=zhipu:glm-4.1v
+glm=zhipu:glm-5.1
+glm-4=zhipu:glm-5.1
 glm-flash=zhipu:glm-4-flash
 
 # MiniMax
@@ -458,10 +458,10 @@ call_claude_cli() {
 
 # ── Universal LLM dispatcher ──────────────────────────────────────────────────
 # Usage: llm_call <messages_json> [model] [system_prompt]
-# model defaults to $_AICLI_MODEL (set by main) → config → claude-sonnet
+# model defaults to $_AICLI_MODEL (set by main) → config → glm
 llm_call() {
   local messages="$1"
-  local model="${2:-${_AICLI_MODEL:-$(cfg_get model || echo claude-sonnet)}}"
+  local model="${2:-${_AICLI_MODEL:-$(cfg_get model || echo glm)}}"
   local system="${3:-}"
 
   need curl; need jq
@@ -676,7 +676,7 @@ mode_chat() {
     info "Loaded session '${session}' ($(( count / 2 )) exchanges)"
   fi
 
-  local model; model="$(cfg_get model || echo claude-sonnet)"
+  local model; model="$(cfg_get model || echo glm)"
   printf "${DIM}Chat  •  model: %s  •  /? for commands${RESET}\n\n" "$model"
 
   chat_send() {
@@ -934,7 +934,7 @@ cmd_check() {
   done
 
   printf "\n${BOLD}Current settings${RESET}\n"
-  printf "  model:    %s\n" "$(cfg_get model   || echo claude-sonnet)"
+  printf "  model:    %s\n" "$(cfg_get model   || echo glm)"
   printf "  mode:     %s\n" "$(cfg_get mode    || echo cmd)"
   printf "  confirm:  %s\n" "$(cfg_get confirm || echo false)"
 }
@@ -970,7 +970,7 @@ ${BOLD}OPTIONS${RESET}
 ${BOLD}MODELS${RESET}  (默认最新版本，aicli config models 查看全部)
   claude-sonnet → claude-sonnet-4-6   claude-opus → claude-opus-4-8
   gpt           → gpt-4.5             deepseek    → deepseek-v4
-  gemini        → gemini-2.5-pro      glm         → glm-4.1v
+  gemini        → gemini-2.5-pro      glm         → glm-5.1
   provider:model-id  直接指定（如 anthropic:claude-3-7-sonnet）
   含 / 的透传 openrouter（如 meta-llama/llama-3.3-70b）
 
@@ -1019,7 +1019,7 @@ main() {
     --version|-V)
       echo "aicli $VERSION"; return ;;
     model)
-      local cur; cur="$(cfg_get model || echo claude-sonnet)"
+      local cur; cur="$(cfg_get model || echo glm)"
       local pair; pair="$(resolve_model "$cur")"
       local model_id; model_id="$(echo "$pair" | cut -d' ' -f2-)"
       printf "model: ${BOLD}%s${RESET}  →  %s\n" "$cur" "$model_id"
@@ -1046,7 +1046,7 @@ main() {
 
   # Determine effective mode and model
   [ -z "$mode" ]  && mode="$(cfg_get mode  || echo cmd)"
-  [ -z "$model" ] && model="$(cfg_get model || echo claude-sonnet)"
+  [ -z "$model" ] && model="$(cfg_get model || echo glm)"
 
   # Apply verbose / log settings
   [ "$verbose" = "true" ] && _VERBOSE=true
