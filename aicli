@@ -210,8 +210,8 @@ gemini-pro=gemini:gemini-2.5-pro
 gemini-flash=gemini:gemini-2.0-flash
 
 # ZhipuAI — GLM
-glm=zhipu:glm-4.1v
-glm-4=zhipu:glm-4.1v
+glm=zhipu:glm-5.1
+glm-4=zhipu:glm-5.1
 glm-flash=zhipu:glm-4-flash
 
 # MiniMax
@@ -970,7 +970,7 @@ ${BOLD}OPTIONS${RESET}
 ${BOLD}MODELS${RESET}  (默认最新版本，aicli config models 查看全部)
   claude-sonnet → claude-sonnet-4-6   claude-opus → claude-opus-4-8
   gpt           → gpt-4.5             deepseek    → deepseek-v4
-  gemini        → gemini-2.5-pro      glm         → glm-4.1v
+  gemini        → gemini-2.5-pro      glm         → glm-5.1
   provider:model-id  直接指定（如 anthropic:claude-3-7-sonnet）
   含 / 的透传 openrouter（如 meta-llama/llama-3.3-70b）
 
