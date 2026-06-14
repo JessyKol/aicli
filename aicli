@@ -666,7 +666,7 @@ CHAT_SYSTEM="You are a concise, precise, sharp assistant.
 
 mode_chat() {
   local initial_prompt="${1:-}" session="${2:-}"
-  local hist_file; hist_file="$(mktemp /tmp/aicli_chat_XXXXXX.json)"
+  local hist_file; hist_file="$(mktemp "${TMPDIR:-/tmp}/aicli_chat_XXXXXX")"
   echo '[]' > "$hist_file"
 
   # Load saved session
