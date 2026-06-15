@@ -290,6 +290,8 @@ call_anthropic() {
   # surface API errors
   local err; err="$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)"
   [ -n "$err" ] && die "Anthropic: $err"
+  local _m; _m="$(printf '%s' "$resp" | jq -r '.model // empty' 2>/dev/null)"
+  [ -n "$_m" ] && [ -n "${_AICLI_MODEL_FILE:-}" ] && printf '%s' "$_m" > "$_AICLI_MODEL_FILE"
   printf '%s' "$resp" | jq -r '.content[0].text'
 }
 
@@ -325,6 +327,8 @@ call_openai_compat() {
 
   local err; err="$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)"
   [ -n "$err" ] && die "API error: $err"
+  local _m; _m="$(printf '%s' "$resp" | jq -r '.model // empty' 2>/dev/null)"
+  [ -n "$_m" ] && [ -n "${_AICLI_MODEL_FILE:-}" ] && printf '%s' "$_m" > "$_AICLI_MODEL_FILE"
   printf '%s' "$resp" | jq -r '.choices[0].message.content'
 }
 
@@ -669,6 +673,20 @@ mode_chat() {
   local hist_file; hist_file="$(mktemp "${TMPDIR:-/tmp}/aicli_chat_XXXXXX")"
   echo '[]' > "$hist_file"
 
+  # Load agent.md for extra system prompt
+  local _agent_content="" _agent_file
+  for _agent_file in "./AGENT.md" "${HOME}/.config/aicli/agent.md"; do
+    [ -f "$_agent_file" ] && _agent_content="$(cat "$_agent_file")" && break
+  done
+  local _sys="$CHAT_SYSTEM"
+  [ -n "$_agent_content" ] && _sys="${_agent_content}
+
+${CHAT_SYSTEM}"
+
+  # Temp file to receive actual model ID from API responses
+  local _model_file; _model_file="$(mktemp "${TMPDIR:-/tmp}/aicli_model_XXXXXX")"
+  export _AICLI_MODEL_FILE="$_model_file"
+
   # Load saved session
   if [ -n "$session" ] && [ -f "${SESSIONS_DIR}/${session}.json" ]; then
     cp "${SESSIONS_DIR}/${session}.json" "$hist_file"
@@ -685,12 +703,18 @@ mode_chat() {
     local messages; messages="$(cat "$hist_file")"
     spin_start "thinking"
     local _tmp; _tmp="$(mktemp)"
-    llm_call "$messages" "$model" "$CHAT_SYSTEM" > "$_tmp" || {
+    llm_call "$messages" "$model" "$_sys" > "$_tmp" || {
       spin_stop; rm -f "$_tmp"
       jq '.[:-1]' "$hist_file" > "${hist_file}.tmp" && mv "${hist_file}.tmp" "$hist_file"
       return
     }
     spin_stop
+    # Show actual model ID from API on first response
+    if [ -s "$_model_file" ]; then
+      local _actual; _actual="$(cat "$_model_file")"
+      [ "$_actual" != "$model" ] && printf "${DIM}← %s${RESET}\n" "$_actual"
+      > "$_model_file"
+    fi
     local reply; reply="$(cat "$_tmp")"; rm -f "$_tmp"
     msgs_append "$hist_file" "assistant" "$reply"
     printf "\n${CYAN}%s${RESET}\n\n" "$reply"
@@ -772,7 +796,8 @@ ${RESET}\n" ;;
     esac
   done
 
-  rm -f "$hist_file"
+  rm -f "$hist_file" "$_model_file"
+  unset _AICLI_MODEL_FILE
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
