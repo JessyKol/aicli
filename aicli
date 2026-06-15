@@ -499,7 +499,7 @@ llm_call() {
       [ -z "$k" ] && die "No ZhipuAI key. Run: ${PROG} config --set zhipu.api_key=..."
       # code plan 用不同 endpoint；标准 plan 用默认地址
       local zhipu_base
-      zhipu_base="$(cfg_get zhipu_base_url || echo "https://open.bigmodel.cn/api/paas/v4")"
+      zhipu_base="$(cfg_get zhipu_base_url || echo "https://open.bigmodel.cn/api/coding/paas/v4")"
       call_openai_compat "$messages" "$model_id" "$k" "$zhipu_base" "$system" ;;
     gemini)
       call_gemini "$messages" "$model_id" "$system" ;;
