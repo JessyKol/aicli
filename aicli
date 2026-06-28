@@ -191,6 +191,7 @@ _builtin_models() {
 # Anthropic — Claude
 claude-sonnet=anthropic:claude-sonnet-4-6
 claude-opus=anthropic:claude-opus-4-8
+claude-opus-4-8=anthropic:claude-opus-4-8
 sonnet=anthropic:claude-sonnet-4-6
 opus=anthropic:claude-opus-4-8
 haiku=anthropic:claude-haiku-3-5
@@ -212,6 +213,8 @@ gemini-flash=gemini:gemini-2.0-flash
 # ZhipuAI — GLM
 glm=zhipu:glm-5.1
 glm-4=zhipu:glm-5.1
+glm-5.1=zhipu:glm-5.1
+glm-5.2=zhipu:glm-5.2
 glm-flash=zhipu:glm-4-flash
 
 # MiniMax
@@ -290,6 +293,8 @@ call_anthropic() {
   # surface API errors
   local err; err="$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)"
   [ -n "$err" ] && die "Anthropic: $err"
+  local _m; _m="$(printf '%s' "$resp" | jq -r '.model // empty' 2>/dev/null)"
+  [ -n "$_m" ] && [ -n "${_AICLI_MODEL_FILE:-}" ] && printf '%s' "$_m" > "$_AICLI_MODEL_FILE"
   printf '%s' "$resp" | jq -r '.content[0].text'
 }
 
@@ -325,6 +330,8 @@ call_openai_compat() {
 
   local err; err="$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)"
   [ -n "$err" ] && die "API error: $err"
+  local _m; _m="$(printf '%s' "$resp" | jq -r '.model // empty' 2>/dev/null)"
+  [ -n "$_m" ] && [ -n "${_AICLI_MODEL_FILE:-}" ] && printf '%s' "$_m" > "$_AICLI_MODEL_FILE"
   printf '%s' "$resp" | jq -r '.choices[0].message.content'
 }
 
@@ -655,6 +662,82 @@ mode_script() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  MODE: agent  — autonomous command loop until goal is achieved
+# ─────────────────────────────────────────────────────────────────────────────
+AGENT_SYSTEM='You are an autonomous shell agent working to achieve a goal.
+Each turn: output ONE shell command to run next, OR the single word DONE if the goal is achieved.
+Rules:
+- Output ONLY a bare shell command or DONE — no markdown, no explanation, no code fences
+- Correct syntax for OS=__OS__, shell=__SHELL__
+- Strategy: observe current state → diagnose root cause → fix → verify
+- After seeing command output (exit_code + stdout/stderr), decide if goal is met'
+
+mode_agent() {
+  local goal="$1" confirm="${2:-false}" max_iter="${3:-10}"
+  local iter=0
+
+  local system="$AGENT_SYSTEM"
+  system="${system/__OS__/$OS}"
+  system="${system/__SHELL__/$CURRENT_SHELL}"
+  system="Goal: ${goal}
+
+${system}"
+
+  local messages
+  messages="$(jq -n --arg p "$goal" '[{"role":"user","content":$p}]')"
+
+  printf "${DIM}Agent  •  goal: %s  •  max %d iterations${RESET}\n\n" "$goal" "$max_iter"
+
+  while [ "$iter" -lt "$max_iter" ]; do
+    iter=$(( iter + 1 ))
+    printf "${DIM}[%d/%d]${RESET} " "$iter" "$max_iter"
+
+    spin_start "thinking"
+    local _tmp; _tmp="$(mktemp "${TMPDIR:-/tmp}/aicli_agent_XXXXXX")"
+    llm_call "$messages" "" "$system" > "$_tmp" || { spin_stop; rm -f "$_tmp"; die "LLM call failed"; }
+    spin_stop
+
+    local cmd; cmd="$(cat "$_tmp")"; rm -f "$_tmp"
+    cmd="$(printf '%s' "$cmd" | sed 's/^```[a-z]*//; s/^```//' | tr -d '`' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+    case "$cmd" in
+      DONE|Done|done)
+        printf "${GREEN}✓ Goal achieved.${RESET}\n"
+        return 0 ;;
+    esac
+
+    printf "\n  ${CYAN}${BOLD}%s${RESET}\n\n" "$cmd"
+
+    if [ "$confirm" = "true" ] || [ "$(cfg_get confirm)" = "true" ]; then
+      printf "${YELLOW}Run? [Y/n/q] ${RESET}"
+      read -r ans
+      case "${ans:-y}" in
+        [Qq]*) printf "${GRAY}Aborted.${RESET}\n"; return ;;
+        [Nn]*)
+          messages="$(printf '%s' "$messages" | jq \
+            --arg c "$cmd" --arg r "User skipped this command. Try a different approach." \
+            '. + [{"role":"assistant","content":$c},{"role":"user","content":$r}]')"
+          continue ;;
+      esac
+    fi
+
+    local output exit_code
+    output="$(eval "$cmd" 2>&1)" || true
+    exit_code=$?
+    printf '%s\n' "$output"
+    [ "$exit_code" -ne 0 ] && printf "${YELLOW}exit: %d${RESET}\n" "$exit_code"
+    printf "\n"
+
+    local result; result="$(printf 'exit_code=%d\n---\n%s' "$exit_code" "$output")"
+    messages="$(printf '%s' "$messages" | jq \
+      --arg c "$cmd" --arg r "$result" \
+      '. + [{"role":"assistant","content":$c},{"role":"user","content":$r}]')"
+  done
+
+  printf "${YELLOW}⚠ Max iterations (%d) reached.${RESET}\n" "$max_iter"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  MODE: chat
 # ─────────────────────────────────────────────────────────────────────────────
 CHAT_SYSTEM="You are a concise, precise, sharp assistant.
@@ -668,6 +751,20 @@ mode_chat() {
   local initial_prompt="${1:-}" session="${2:-}"
   local hist_file; hist_file="$(mktemp "${TMPDIR:-/tmp}/aicli_chat_XXXXXX")"
   echo '[]' > "$hist_file"
+
+  # Load agent.md for extra system prompt
+  local _agent_content="" _agent_file
+  for _agent_file in "./AGENT.md" "${HOME}/.config/aicli/agent.md"; do
+    [ -f "$_agent_file" ] && _agent_content="$(cat "$_agent_file")" && break
+  done
+  local _sys="$CHAT_SYSTEM"
+  [ -n "$_agent_content" ] && _sys="${_agent_content}
+
+${CHAT_SYSTEM}"
+
+  # Temp file to receive actual model ID from API responses
+  local _model_file; _model_file="$(mktemp "${TMPDIR:-/tmp}/aicli_model_XXXXXX")"
+  export _AICLI_MODEL_FILE="$_model_file"
 
   # Load saved session
   if [ -n "$session" ] && [ -f "${SESSIONS_DIR}/${session}.json" ]; then
@@ -685,12 +782,18 @@ mode_chat() {
     local messages; messages="$(cat "$hist_file")"
     spin_start "thinking"
     local _tmp; _tmp="$(mktemp)"
-    llm_call "$messages" "$model" "$CHAT_SYSTEM" > "$_tmp" || {
+    llm_call "$messages" "$model" "$_sys" > "$_tmp" || {
       spin_stop; rm -f "$_tmp"
       jq '.[:-1]' "$hist_file" > "${hist_file}.tmp" && mv "${hist_file}.tmp" "$hist_file"
       return
     }
     spin_stop
+    # Show actual model ID from API on first response
+    if [ -s "$_model_file" ]; then
+      local _actual; _actual="$(cat "$_model_file")"
+      [ "$_actual" != "$model" ] && printf "${DIM}← %s${RESET}\n" "$_actual"
+      > "$_model_file"
+    fi
     local reply; reply="$(cat "$_tmp")"; rm -f "$_tmp"
     msgs_append "$hist_file" "assistant" "$reply"
     printf "\n${CYAN}%s${RESET}\n\n" "$reply"
@@ -772,7 +875,8 @@ ${RESET}\n" ;;
     esac
   done
 
-  rm -f "$hist_file"
+  rm -f "$hist_file" "$_model_file"
+  unset _AICLI_MODEL_FILE
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -957,20 +1061,23 @@ ${BOLD}MODES${RESET}  (-m / --mode)
   cmd      Natural language → shell command, runs immediately  [default]
   script   Generate a reusable script file (sh / py / ts / …)
   chat     Multi-turn conversation with context
+  agent    Autonomous loop: run → observe → fix → repeat until goal met
 
 ${BOLD}OPTIONS${RESET}
-  -m, --mode  <cmd|script|chat>   Set mode
-  --model     <name>              LLM to use (see below)
-  --confirm                       Ask before running commands
-  --lang      <sh|py|ts|auto>     Script language preference
-  -o, --output <file>             Save script to path (script mode)
-  --session   <id>                Load/save chat session by name
-  -h, --help                      Show this help
+  -m, --mode  <cmd|script|chat|agent>   Set mode
+  --model     <name>                    LLM to use (see below)
+  --confirm                             Ask before running commands
+  --lang      <sh|py|ts|auto>           Script language preference
+  -o, --output <file>                   Save script to path (script mode)
+  --session   <id>                      Load/save chat session by name
+  -a, --agent                           Shorthand for -m agent
+  --max-iter  <n>                       Max agent iterations (default: 10)
+  -h, --help                            Show this help
 
 ${BOLD}MODELS${RESET}  (默认最新版本，aicli config models 查看全部)
-  claude-sonnet → claude-sonnet-4-6   claude-opus → claude-opus-4-8
-  gpt           → gpt-4.5             deepseek    → deepseek-v4
-  gemini        → gemini-2.5-pro      glm         → glm-5.1
+  claude-sonnet → claude-sonnet-4-6   claude-opus / claude-opus-4-8 → claude-opus-4-8
+  gpt           → gpt-5.5             deepseek    → deepseek-v4
+  gemini        → gemini-2.5-pro      glm / glm-5.1 / glm-5.2 → zhipu
   provider:model-id  直接指定（如 anthropic:claude-3-7-sonnet）
   含 / 的透传 openrouter（如 meta-llama/llama-3.3-70b）
 
@@ -985,11 +1092,13 @@ ${BOLD}CONFIG${RESET}
 ${BOLD}EXAMPLES${RESET}
   aicli "list docker containers sorted by memory"
   aicli --confirm "delete all .DS_Store files under \$HOME"
-  aicli --model deepseek "show top 10 processes by cpu"
+  aicli --model glm-5.2 "show top 10 processes by cpu"
   aicli -m script "backup mysql to S3 with daily rotation"
   aicli -m script --lang py "parse nginx logs and plot request rate"
   aicli -m chat
   aicli -m chat --session work "explain kubernetes ingress"
+  aicli --agent "nginx is returning 502, diagnose and fix"
+  aicli --agent --max-iter 15 --model claude-opus "redis OOM, find and resolve"
   aicli check
 EOF
 }
@@ -1003,7 +1112,7 @@ main() {
 
   local mode="" model="" confirm="false" lang="auto" output="" session=""
   local prompt_parts=()
-  local verbose="false" logfile=""
+  local verbose="false" logfile="" max_iter="10"
 
   # Check for subcommands first
   case "${1:-}" in
@@ -1035,6 +1144,8 @@ main() {
       --lang)       lang="$2";    shift 2 ;;
       -o|--output)  output="$2";  shift 2 ;;
       --session)    session="$2"; shift 2 ;;
+      -a|--agent)   mode="agent"; shift ;;
+      --max-iter)   max_iter="$2"; shift 2 ;;
       -v|--verbose) verbose="true"; shift ;;
       --log)        logfile="$2"; shift 2 ;;
       -h|--help)    usage; return ;;
@@ -1072,8 +1183,12 @@ main() {
     chat)
       mode_chat "$prompt" "$session"
       ;;
+    agent)
+      [ -z "$prompt" ] && die "Provide a goal.  Example: aicli --agent \"nginx is returning 502, fix it\""
+      mode_agent "$prompt" "$confirm" "$max_iter"
+      ;;
     *)
-      die "Unknown mode: $mode. Use: cmd | script | chat"
+      die "Unknown mode: $mode. Use: cmd | script | chat | agent"
       ;;
   esac
 }
