@@ -213,6 +213,9 @@ gemini-flash=gemini:gemini-2.0-flash
 
 # ZhipuAI — GLM (无 latest 端点，手动指定最新版)
 glm=zhipu:glm-5.2
+glm-5.1=zhipu:glm-5.1
+glm-5.2=zhipu:glm-5.2
+glm-flash=zhipu:glm-4-flash
 
 # MiniMax
 minimax=minimax:abab6.5s-chat
